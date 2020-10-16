@@ -26,7 +26,7 @@ char* outputFilename = NULL;
 int maxThreads = 0;
 int synchstrategy = NOSYNC;
 
-lock_t queue_lock;
+pthread_mutex_t queue_lock;
 lock_t fs_lock;
 
 char inputCommands[MAX_COMMANDS][MAX_INPUT_SIZE];
@@ -50,10 +50,10 @@ static void arguments(int argc, char* const argv[]) { //funcao que faz parse aos
     if(maxThreads <= 0) { //tem de existir um numero de threads valido
         fprintf(stderr, "Please use a valid number of threads\n");
     }
-    else if(strcmp(synchstrategy, "nosync") != 0 && strcmp(synchstrategy, "mutex") != 0 && strcmp(synchstrategy, "rwlock") != 0) { //so existem tres metodos possiveis
+    else if(strcmp(argv[4], "nosync") != 0 && strcmp(argv[4], "mutex") != 0 && strcmp(argv[4], "rwlock") != 0) { //so existem tres metodos possiveis
         fprintf(stderr, "Please use a valid sync method from the following:\n mutex, rwlock, nosync\n");
     }
-    else if(strcmp(synchstrategy, "nosync") == 0 && maxThreads != 1) {  //o metodo nosync so pode ter uma thread
+    else if(strcmp(argv[4], "nosync") == 0 && maxThreads != 1) {  //o metodo nosync so pode ter uma thread
         fprintf(stderr, "When using nosync the number of threads must be 1\n");
     }
 }
@@ -79,13 +79,31 @@ void errorParse(){
     exit(EXIT_FAILURE);
 }
 
+void mutex_lock(pthread_mutex_t* mutex) {
+    if(pthread_mutex_lock(mutex) != 0) {
+        fprintf(stderr, "Couldn't lock mutex\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void mutex_unlock(pthread_mutex_t* mutex) {
+    if(pthread_mutex_unlock(mutex) != 0) {
+        fprintf(stderr, "Couldn't unlock mutex\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void mutex_init(pthread_mutex_t* mutex) {
+    if(pthread_mutex_init(mutex, NULL) != 0) {
+        fprintf(stderr, "Couldn't initialize mutex\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
 void init_lock(lock_t* lock) {
     switch(synchstrategy) {
         case MUTEX:
-            if(pthread_mutex_init(&(lock->mutex), NULL) != 0) {
-                fprintf(stderr, "Couldn't initialize mutex\n");
-                exit(EXIT_FAILURE);
-            }
+            mutex_init(&(lock->mutex));
             break;
         case RWLOCK:
             if(pthread_rwlock_init(&(lock->rwlock), NULL) != 0) {
@@ -99,10 +117,7 @@ void init_lock(lock_t* lock) {
 void readlock(lock_t* lock) {
     switch(synchstrategy) {
         case MUTEX:
-            if(pthread_mutex_lock(&(lock->mutex)) != 0) {
-                fprintf(stderr, "Couldn't lock mutex\n");
-                exit(EXIT_FAILURE);
-            }
+            mutex_lock(&(lock->mutex));
             break;
         case RWLOCK:
             if(pthread_rwlock_rdlock(&(lock->rwlock)) != 0) {
@@ -116,10 +131,7 @@ void readlock(lock_t* lock) {
 void writelock(lock_t* lock) {
     switch(synchstrategy) {
         case MUTEX:
-            if(pthread_mutex_lock(&(lock->mutex)) != 0) {
-                fprintf(stderr, "Couldn't lock mutex\n");
-                exit(EXIT_FAILURE);
-            }
+            mutex_lock(&(lock->mutex));
             break;
         case RWLOCK:
             if(pthread_rwlock_wrlock(&(lock->rwlock)) != 0) {
@@ -133,10 +145,7 @@ void writelock(lock_t* lock) {
 void unlock(lock_t* lock) {
     switch(synchstrategy) {
         case MUTEX:
-            if(pthread_mutex_unlock(&(lock->mutex)) != 0) {
-                fprintf(stderr, "Couldn't unlock mutex\n");
-                exit(EXIT_FAILURE);
-            }
+            mutex_unlock(&(lock->mutex));
             break;
         case RWLOCK:
             if(pthread_rwlock_unlock(&(lock->rwlock)) != 0) {
@@ -209,8 +218,9 @@ FILE* openOutput() {
 
 void* applyCommands() {
     while (numberCommands > 0) {
-        mutex_lock(&lock);
+        mutex_lock(&queue_lock);
         const char* command = removeCommand();
+        mutex_unlock(&queue_lock);
         if (command == NULL){
             continue;
         }
@@ -225,31 +235,38 @@ void* applyCommands() {
         int searchResult;
         switch (token) {
             case 'c':
-
                 switch (type) {
                     case 'f':
+                        writelock(&fs_lock);
                         printf("Create file: %s\n", name);
                         create(name, T_FILE);
+                        unlock(&fs_lock);
                         break;
                     case 'd':
+                        writelock(&fs_lock);
                         printf("Create directory: %s\n", name);
                         create(name, T_DIRECTORY);
+                        unlock(&fs_lock);
                         break;
                     default:
                         fprintf(stderr, "Error: invalid node type\n");
                         exit(EXIT_FAILURE);
                 }
                 break;
-            case 'l': 
+            case 'l':
+                readlock(&fs_lock);
                 searchResult = lookup(name);
+                unlock(&fs_lock);
                 if (searchResult >= 0)
                     printf("Search: %s found\n", name);
                 else
                     printf("Search: %s not found\n", name);
                 break;
             case 'd':
+                writelock(&fs_lock);
                 printf("Delete: %s\n", name);
                 delete(name);
+                unlock(&fs_lock);
                 break;
             default: { /* error */
                 fprintf(stderr, "Error: command to apply\n");
@@ -262,20 +279,20 @@ void* applyCommands() {
 
 void runThreads(){
     if(synchstrategy != NOSYNC) {
-        pthread_t* thread_id = malloc(maxThreads * sizeof(pthread_t));
+        pthread_t* thread_list = malloc(maxThreads * sizeof(pthread_t));
         for(int i = 0; i < maxThreads; i++) {
-            if(pthread_create(thread_id[i], NULL, applyCommands, NULL) != 0) {
+            if(pthread_create(&thread_list[i], NULL, applyCommands, NULL) != 0) {
                 printf("Couldn't create thread\n");
                 exit(EXIT_FAILURE);
             }
         }
-        for(i = 0; i < maxThreads; i++) {
-            if(pthread_join(thread_id[i], NULL) != 0) {
+        for(int i = 0; i < maxThreads; i++) {
+            if(pthread_join(thread_list[i], NULL) != 0) {
                 printf("Couldn't join thread\n");
                 exit(EXIT_FAILURE);
             }
         }
-        free(thread_id);
+        free(thread_list);
     }
     else {
         applyCommands();
@@ -288,8 +305,8 @@ int main(int argc, char* argv[]) {
     outputFile = openOutput();
     /* init filesystem */
     init_fs();
-    init_lock(*queue_lock);
-    init_lock(*fs_lock);
+    mutex_init(&queue_lock);
+    init_lock(&fs_lock);
 
     /* process input and print tree */
     processInput();
