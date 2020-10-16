@@ -4,12 +4,19 @@
 #include <string.h>
 #include <ctype.h>
 #include "fs/operations.h"
-#include <time.h>
-#include<pthread.h>
+#include <sys/time.h>
+#include <pthread.h>
 
 #define MAX_COMMANDS 150000
 #define MAX_INPUT_SIZE 100
+#define NOSYNC 0
+#define MUTEX 1
+#define RWLOCK 2
 
+typedef struct lock {
+    pthread_mutex_t mutex;
+    pthread_rwlock_t rwlock;
+} lock_t;
 
 /*variaveis globais que guardam os parametros com que se inicializa o programa:
 tecnicofs inputfile outputfile maxThreads synchstrategy*/
@@ -17,7 +24,10 @@ tecnicofs inputfile outputfile maxThreads synchstrategy*/
 char* inputFilename = NULL;
 char* outputFilename = NULL;
 int maxThreads = 0;
-char* synchstrategy = NULL;
+int synchstrategy = NOSYNC;
+
+lock_t queue_lock;
+lock_t fs_lock;
 
 char inputCommands[MAX_COMMANDS][MAX_INPUT_SIZE];
 int numberCommands = 0;
@@ -30,8 +40,13 @@ static void arguments(int argc, char* const argv[]) { //funcao que faz parse aos
     inputFilename = argv[1];    //ficheiro de onde se le
     outputFilename = argv[2];   //ficheiro para onde se escreve
     maxThreads = atoi(argv[3]);  //numero de tarefas
-    synchstrategy = argv[4];    //estrategia de sincronizacao (nosync, mutex ou rwlock)
-
+    if(strcmp(argv[4], "mutex")) {  //estrategia de sincronizacao (nosync, mutex ou rwlock)
+        synchstrategy = MUTEX;
+    }
+    else if(strcmp(argv[4], "rwlock")) {
+        synchstrategy = RWLOCK;
+    }
+        
     if(maxThreads <= 0) { //tem de existir um numero de threads valido
         fprintf(stderr, "Please use a valid number of threads\n");
     }
@@ -62,6 +77,74 @@ char* removeCommand() {
 void errorParse(){
     fprintf(stderr, "Error: invalid command\n");
     exit(EXIT_FAILURE);
+}
+
+void init_lock(lock_t* lock) {
+    switch(synchstrategy) {
+        case MUTEX:
+            if(pthread_mutex_init(&(lock->mutex), NULL) != 0) {
+                fprintf(stderr, "Couldn't initialize mutex\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case RWLOCK:
+            if(pthread_rwlock_init(&(lock->rwlock), NULL) != 0) {
+                fprintf(stderr, "Couldn't initialize rwlock\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+    }
+}
+
+void readlock(lock_t* lock) {
+    switch(synchstrategy) {
+        case MUTEX:
+            if(pthread_mutex_lock(&(lock->mutex)) != 0) {
+                fprintf(stderr, "Couldn't lock mutex\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case RWLOCK:
+            if(pthread_rwlock_rdlock(&(lock->rwlock)) != 0) {
+                fprintf(stderr, "Couldn't lock rwlock\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+    }
+}
+
+void writelock(lock_t* lock) {
+    switch(synchstrategy) {
+        case MUTEX:
+            if(pthread_mutex_lock(&(lock->mutex)) != 0) {
+                fprintf(stderr, "Couldn't lock mutex\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case RWLOCK:
+            if(pthread_rwlock_wrlock(&(lock->rwlock)) != 0) {
+                fprintf(stderr, "Couldn't lock rwlock\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+    }
+}
+
+void unlock(lock_t* lock) {
+    switch(synchstrategy) {
+        case MUTEX:
+            if(pthread_mutex_unlock(&(lock->mutex)) != 0) {
+                fprintf(stderr, "Couldn't unlock mutex\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+        case RWLOCK:
+            if(pthread_rwlock_unlock(&(lock->rwlock)) != 0) {
+                fprintf(stderr, "Couldn't unlock rwlock\n");
+                exit(EXIT_FAILURE);
+            }
+            break;
+    }
 }
 
 void processInput(){
@@ -124,65 +207,78 @@ FILE* openOutput() {
     return outputFile;
 }
 
-void *applyCommand(char *command){
-    char token, type;
-    char name[MAX_INPUT_SIZE];
-    int numTokens = sscanf(command, "%c %s %c", &token, name, &type);
-    if (numTokens < 2) {
-        fprintf(stderr, "Error: invalid command in Queue\n");
-        exit(EXIT_FAILURE);
-    }
-
-    int searchResult;
-    switch (token) {
-        case 'c':
-            switch (type) {
-                case 'f':
-                    printf("Create file: %s\n", name);
-                    create(name, T_FILE);
-                    break;
-                case 'd':
-                    printf("Create directory: %s\n", name);
-                    create(name, T_DIRECTORY);
-                    break;
-                default:
-                    fprintf(stderr, "Error: invalid node type\n");
-                    exit(EXIT_FAILURE);
-            }
-            break;
-        case 'l': 
-            searchResult = lookup(name);
-            if (searchResult >= 0)
-                printf("Search: %s found\n", name);
-            else
-                printf("Search: %s not found\n", name);
-            break;
-        case 'd':
-            printf("Delete: %s\n", name);
-            delete(name);
-            break;
-        default: { /* error */
-            fprintf(stderr, "Error: command to apply\n");
-            exit(EXIT_FAILURE);
-        }
-    }
-}
-
-
-
-void applyCommands(){
-    pthread_t *thread_id;
-    int numberThreads;
-    thread_id = malloc(sizeof(thread_id));
-    while (numberCommands > 0){
+void* applyCommands() {
+    while (numberCommands > 0) {
+        mutex_lock(&lock);
         const char* command = removeCommand();
         if (command == NULL){
             continue;
         }
-        for (int i = 0 ; i< maxThreads; i++){
-            pthread_create(&thread_id[i], NULL, applyCommand , (void *)command);
-             numberThreads++;
+        char token, type;
+        char name[MAX_INPUT_SIZE];
+        int numTokens = sscanf(command, "%c %s %c", &token, name, &type);
+        if (numTokens < 2) {
+            fprintf(stderr, "Error: invalid command in Queue\n");
+            exit(EXIT_FAILURE);
         }
+
+        int searchResult;
+        switch (token) {
+            case 'c':
+
+                switch (type) {
+                    case 'f':
+                        printf("Create file: %s\n", name);
+                        create(name, T_FILE);
+                        break;
+                    case 'd':
+                        printf("Create directory: %s\n", name);
+                        create(name, T_DIRECTORY);
+                        break;
+                    default:
+                        fprintf(stderr, "Error: invalid node type\n");
+                        exit(EXIT_FAILURE);
+                }
+                break;
+            case 'l': 
+                searchResult = lookup(name);
+                if (searchResult >= 0)
+                    printf("Search: %s found\n", name);
+                else
+                    printf("Search: %s not found\n", name);
+                break;
+            case 'd':
+                printf("Delete: %s\n", name);
+                delete(name);
+                break;
+            default: { /* error */
+                fprintf(stderr, "Error: command to apply\n");
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+    return NULL;
+}
+
+void runThreads(){
+    if(synchstrategy != NOSYNC) {
+        pthread_t* thread_id = malloc(maxThreads * sizeof(pthread_t));
+        for(int i = 0; i < maxThreads; i++) {
+            if(pthread_create(thread_id[i], NULL, applyCommands, NULL) != 0) {
+                printf("Couldn't create thread\n");
+                exit(EXIT_FAILURE);
+            }
+        }
+        for(i = 0; i < maxThreads; i++) {
+            if(pthread_join(thread_id[i], NULL) != 0) {
+                printf("Couldn't join thread\n");
+                exit(EXIT_FAILURE);
+            }
+        }
+        free(thread_id);
+    }
+    else {
+        applyCommands();
     }
 }
 
@@ -192,6 +288,8 @@ int main(int argc, char* argv[]) {
     outputFile = openOutput();
     /* init filesystem */
     init_fs();
+    init_lock(*queue_lock);
+    init_lock(*fs_lock);
 
     /* process input and print tree */
     processInput();
