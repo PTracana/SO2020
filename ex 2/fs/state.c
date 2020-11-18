@@ -2,11 +2,47 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "state.h"
 #include "../tecnicofs-api-constants.h"
 
 inode_t inode_table[INODE_TABLE_SIZE];
 
+
+void init_lock(pthread_rwlock_t* lock) {      //initializes the rw lock
+    if(pthread_rwlock_init(lock, NULL) != 0) {
+        fprintf(stderr, "Couldn't initialize rwlock\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void destroy_lock(pthread_rwlock_t* lock) {     //destroys the rw lock
+    if(pthread_rwlock_destroy(lock) != 0) {
+        fprintf(stderr, "Couldn't destroy rwlock\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void readlock(int inumber) {       //prevents other threads from reading from the locked content
+    if(pthread_rwlock_rdlock(&(inode_table[inumber].rwlock)) != 0) {
+        fprintf(stderr, "Couldn't lock rwlock\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void writelock(int inumber) {      //prevents other threads from writing to the locked content
+    if(pthread_rwlock_wrlock(&(inode_table[inumber].rwlock)) != 0) {
+        fprintf(stderr, "Couldn't lock rwlock\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void unlock(int inumber) {     //unlocks the rw lock
+    if(pthread_rwlock_unlock(&(inode_table[inumber].rwlock)) != 0) {
+        fprintf(stderr, "Couldn't unlock rwlock\n");
+        exit(EXIT_FAILURE);
+    }
+}
 
 /*
  * Sleeps for synchronization testing.
@@ -24,6 +60,7 @@ void inode_table_init() {
         inode_table[i].nodeType = T_NONE;
         inode_table[i].data.dirEntries = NULL;
         inode_table[i].data.fileContents = NULL;
+        init_lock(&(inode_table[i].rwlock));
     }
 }
 
@@ -36,9 +73,10 @@ void inode_table_destroy() {
         if (inode_table[i].nodeType != T_NONE) {
             /* as data is an union, the same pointer is used for both dirEntries and fileContents */
             /* just release one of them */
-	  if (inode_table[i].data.dirEntries)
+	    if (inode_table[i].data.dirEntries)
             free(inode_table[i].data.dirEntries);
         }
+        destroy_lock(&(inode_table[i].rwlock));
     }
 }
 
@@ -53,7 +91,6 @@ void inode_table_destroy() {
 int inode_create(type nType) {
     /* Used for testing synchronization speedup */
     insert_delay(DELAY);
-
     for (int inumber = 0; inumber < INODE_TABLE_SIZE; inumber++) {
         if (inode_table[inumber].nodeType == T_NONE) {
             inode_table[inumber].nodeType = nType;
@@ -92,8 +129,9 @@ int inode_delete(int inumber) {
 
     inode_table[inumber].nodeType = T_NONE;
     /* see inode_table_destroy function */
-    if (inode_table[inumber].data.dirEntries)
+    if (inode_table[inumber].data.dirEntries) {
         free(inode_table[inumber].data.dirEntries);
+    }
     return SUCCESS;
 }
 
@@ -109,7 +147,6 @@ int inode_delete(int inumber) {
 int inode_get(int inumber, type *nType, union Data *data) {
     /* Used for testing synchronization speedup */
     insert_delay(DELAY);
-
     if ((inumber < 0) || (inumber > INODE_TABLE_SIZE) || (inode_table[inumber].nodeType == T_NONE)) {
         printf("inode_get: invalid inumber %d\n", inumber);
         return FAIL;

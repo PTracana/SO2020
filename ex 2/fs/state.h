@@ -46,6 +46,11 @@ typedef struct inode_t {
 } inode_t;
 
 
+void init_lock(pthread_rwlock_t* lock);
+void destroy_lock(pthread_rwlock_t* lock);
+void readlock(int inumber);
+void writelock(int inumber);
+void unlock(int inumber);
 void insert_delay(int cycles);
 void inode_table_init();
 void inode_table_destroy();

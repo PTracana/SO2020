@@ -7,8 +7,13 @@
 #include <sys/time.h>
 #include <pthread.h>
 
-#define MAX_COMMANDS 150000
+#define MAX_COMMANDS 10
 #define MAX_INPUT_SIZE 100
+
+struct Buffer {
+    char data[MAX_INPUT_SIZE];
+    struct Buffer *next;
+};
 
 /*global variables that are used when initializing the program:
 tecnicofs inputfile outputfile maxThreads synchstrategy*/
@@ -17,9 +22,17 @@ char* inputFilename = NULL;     //file from where you extract data for the file 
 char* outputFilename = NULL;    //file to which you write the file system's output
 int maxThreads = 0;             //maximum number of threads is stored here
 
-char inputCommands[MAX_COMMANDS][MAX_INPUT_SIZE];
+char inputCommands[MAX_COMMANDS][MAX_INPUT_SIZE]; //erase later
 int numberCommands = 0;
 int headQueue = 0;
+struct Buffer buffer;
+int isDone = 0; //0 = false, 1 = true
+
+pthread_mutex_t commandLock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t insertLock =  PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t removeLock =  PTHREAD_MUTEX_INITIALIZER; 
+pthread_cond_t condInsert = PTHREAD_COND_INITIALIZER;
+pthread_cond_t condRemove = PTHREAD_COND_INITIALIZER;
 
 static void arguments(int argc, char* const argv[]) {   //this function parses the program's variables
     if(argc != 4) {                                     //the function only succeeds if you have exactly 5 arguments and if their typings are correct
@@ -37,17 +50,43 @@ static void arguments(int argc, char* const argv[]) {   //this function parses t
 }
 
 int insertCommand(char* data) {
+    pthread_mutex_lock(&commandLock);
+    struct Buffer *temp;
+    temp = &buffer;
     if(numberCommands != MAX_COMMANDS) {
-        strcpy(inputCommands[numberCommands++], data);
+        for(int i = 0; i < MAX_COMMANDS; i++) {
+            if(temp->data[0] == '\0') {
+                numberCommands++;
+                strcpy(temp->data, data);
+                break;
+            }
+            temp = temp->next;
+        }
+        pthread_mutex_unlock(&commandLock);
+        pthread_cond_signal(&condInsert);
         return 1;
     }
+    pthread_mutex_unlock(&commandLock);
     return 0;
 }
 
 char* removeCommand() {
-    if(numberCommands > 0){
+    struct Buffer *temp;
+    char *tempCommand = malloc(sizeof(char)*MAX_INPUT_SIZE);
+    temp = &buffer;
+    if(numberCommands > 0) {
+        for(int i = 0; i < MAX_COMMANDS; i++) {
+            if(temp->data[0] == '\0') {
+                temp = temp->next;
+            }
+            else {
+                strcpy(tempCommand, temp->data);
+                temp->data[0] = '\0';
+                break;
+            }
+        }
         numberCommands--;
-        return inputCommands[headQueue++];  
+        return tempCommand; 
     }
     return NULL;
 }
@@ -56,37 +95,9 @@ void errorParse(){
     fprintf(stderr, "Error: invalid command\n");
     exit(EXIT_FAILURE);
 }
-
-void init_lock(pthread_rwlock_t* lock) {      //initializes the mutex/rw lock
-    if(pthread_rwlock_init(&lock, NULL) != 0) {
-        fprintf(stderr, "Couldn't initialize rwlock\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-void readlock(pthread_rwlock_t* lock) {       //prevents other threads from reading from the locked content
-    if(pthread_rwlock_rdlock(&lock) != 0) {
-        fprintf(stderr, "Couldn't lock rwlock\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-void writelock(pthread_rwlock_t* lock) {      //prevents other threads from writing to the locked content
-    if(pthread_rwlock_wrlock(&lock) != 0) {
-        fprintf(stderr, "Couldn't lock rwlock\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-void unlock(pthread_rwlock_t* lock) {     //unlocks the mutex/rw lock
-    if(pthread_rwlock_unlock(&lock) != 0) {
-        fprintf(stderr, "Couldn't unlock rwlock\n");
-        exit(EXIT_FAILURE);
-    }
-}
     
 
-void processInput(){
+void* processInput(){
     FILE* inputFile;
     inputFile = fopen(inputFilename, "r");  //input file is opened for reading only
     if(!inputFile) {                        //the program can't run without an input file
@@ -102,6 +113,12 @@ void processInput(){
 
         int numTokens = sscanf(line, "%c %s %c", &token, name, &type);
 
+        if(numberCommands == MAX_COMMANDS) {
+            pthread_mutex_lock(&removeLock);
+            pthread_cond_wait(&condRemove, &removeLock);
+            pthread_mutex_unlock(&removeLock);
+        }
+
         /* perform minimal validation */
         if (numTokens < 1) {
             continue;
@@ -112,21 +129,28 @@ void processInput(){
                     errorParse();
                 if(insertCommand(line))
                     break;
-                return;
+                return NULL;
             
             case 'l':
                 if(numTokens != 2)
                     errorParse();
                 if(insertCommand(line))
                     break;
-                return;
+                return NULL;
             
             case 'd':
                 if(numTokens != 2)
                     errorParse();
                 if(insertCommand(line))
                     break;
-                return;
+                return NULL;
+
+            case 'm':
+                if(numTokens != 3)
+                    errorParse();
+                if(insertCommand(line))
+                    break;
+                return NULL;
             
             case '#':
                 break;
@@ -136,7 +160,10 @@ void processInput(){
             }
         }
     }
+    isDone = 1;
+    pthread_cond_signal(&condInsert);
     fclose(inputFile);
+    return NULL;
 }
 
 FILE* openOutput() {        //the output file is opened for writing only
@@ -148,24 +175,32 @@ FILE* openOutput() {        //the output file is opened for writing only
     return outputFile;
 }
 
-/* 
-applyCommands vai ser separado em 2: a primeira parte vai ter a extração do comando e criação de threads.
-Um array de comandos que estão a ser usados por threads permite-nos detetar se o próximo comando é compatível.
-Vamos ter também um int com o numero de comandos que estão a ser usados e um malloc para as threads = maxThreads.
-A compatibilidade é verificada através de uma série de condições especificadas no enunciado do projeto.
-No caso de haver compatibilidade, o comando é adicionado ao vetor de comandos atuais e é criada uma thread com o verdadeiro applyCommands.
-No caso de não o ser, as threads atuais fazem join, o array de comandos usados é esvaziado e cria-se uma thread para o novo comando.
-*/
-
 void* applyCommands() {
-    while (numberCommands > 0) {
-        const char* command = removeCommand();
+    while(isDone == 0 || numberCommands != 0){
+        if(numberCommands == 0) {
+            pthread_mutex_lock(&insertLock);
+            pthread_cond_wait(&condInsert, &insertLock);
+            pthread_mutex_unlock(&insertLock);
+        }
+        pthread_mutex_lock(&commandLock);
+        char* command = removeCommand();
+        pthread_cond_signal(&condRemove);
+        pthread_mutex_unlock(&commandLock);
+
         if (command == NULL){
             continue;
         }
+        int numTokens;
         char token, type;
         char name[MAX_INPUT_SIZE];
-        int numTokens = sscanf(command, "%c %s %c", &token, name, &type);
+        char name2[MAX_INPUT_SIZE];
+        if(command[0] == 'm'){
+            numTokens = sscanf(command, "%c %s %s", &token, name, name2);
+        }
+        else{
+            numTokens = sscanf(command, "%c %s %c", &token, name, &type);
+        }
+        free(command);
         if (numTokens < 2) {
             fprintf(stderr, "Error: invalid command in Queue\n");
             exit(EXIT_FAILURE);
@@ -199,42 +234,74 @@ void* applyCommands() {
                 printf("Delete: %s\n", name);
                 delete(name);
                 break;
+            case 'm': 
+                searchResult = lookup(name);
+                if (searchResult >= 0){
+                    printf("Search: %s found\n", name);
+                    searchResult = lookup(name2);
+                    if (searchResult >= 0){
+                        printf("Search: %s found\n", name);
+                        move(name, name2);
+                    }          
+                    else{
+                        printf("Search: %s not found\n", name);
+                        break;
+                    }
+                }
+                else{
+                    printf("Search: %s not found\n", name);
+                    break;
+                }
+            
             default: { /* error */
                 fprintf(stderr, "Error: command to apply\n");
                 exit(EXIT_FAILURE);
             }
         }
     }
+    pthread_cond_signal(&condInsert);
     return NULL;
 }
 
-/*void runThreads(){      //this function is now useless
-    if(synchstrategy != NOSYNC) {
-        pthread_t* thread_list = malloc(maxThreads * sizeof(pthread_t));
-        for(int i = 0; i < maxThreads; i++) {
-            if(pthread_create(&thread_list[i], NULL, applyCommands, NULL) != 0) {
-                printf("Couldn't create thread\n");
-                exit(EXIT_FAILURE);
-            }
+void runThreads() {
+    pthread_t processThread;
+    pthread_t* thread_list = malloc(maxThreads * sizeof(pthread_t));
+    pthread_create(&processThread, NULL, processInput, NULL);
+    for(int i = 0; i < maxThreads; i++) {
+        if(pthread_create(&thread_list[i], NULL, applyCommands, NULL) != 0) {
+            printf("Couldn't create thread\n");
+            exit(EXIT_FAILURE);
         }
-        for(int i = 0; i < maxThreads; i++) {
-            if(pthread_join(thread_list[i], NULL) != 0) {
-                printf("Couldn't join thread\n");
-                exit(EXIT_FAILURE);
-            }
+    }
+    for(int i = 0; i < maxThreads; i++) {
+        if(pthread_join(thread_list[i], NULL) != 0) {
+            printf("Couldn't join thread\n");
+            exit(EXIT_FAILURE);
         }
-        free(thread_list);
     }
-    else {      //if you chose the nosync strategy, the program will only have one thread and thus doesn't need to create more
-        applyCommands();
+    pthread_join(processThread, NULL);
+    free(thread_list);
+
+}
+
+void initBuffer() {
+    struct Buffer *temp;
+    temp = &buffer;
+    for(int i = 1; i < MAX_COMMANDS; i++) {
+        temp->next = malloc(sizeof(struct Buffer));
+        temp->data[0] = '\0';
+        temp = temp->next;
     }
-}*/
+    temp->data[0] = '\0';
+    temp->next = &buffer;
+}
 
 int main(int argc, char* argv[]) {
     double elapsedTime;     //number of seconds the program ran for
     struct timeval startTime;
     struct timeval stopTime;
     FILE* outputFile;
+    initBuffer();
     arguments(argc, argv);
     outputFile = openOutput();
     /* init filesystem */
@@ -243,12 +310,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Couldn't get time\n");
         exit(EXIT_FAILURE);
     }
-    /*mutex_init(&queue_lock);
-    init_lock(&fs_lock);*/
 
     /* process input and print tree */
-    processInput();
-    applyCommands();
+    runThreads();
     if(gettimeofday(&stopTime, NULL) != 0) {    //the program obtains its stopping time from the pc's clock
         fprintf(stderr, "Couldn't get time\n");
         exit(EXIT_FAILURE);
