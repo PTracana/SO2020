@@ -8,6 +8,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <pthread.h>
+#include <unistd.h>
+
 
 #define MAX_INPUT_SIZE 100
 
@@ -55,7 +57,7 @@ void* applyCommands() {
             numTokens = sscanf(command, "%c %s %s", &token, name, name2);
         }
         else if(command[0] == 'p') {
-            numTokens = sscanf(command, "%c %s %s", &token, name);
+            numTokens = sscanf(command, "%c %s", &token, name);
         }
         else {
             numTokens = sscanf(command, "%c %s %c", &token, name, &type);
@@ -155,7 +157,7 @@ int setSocket(char* sockPath) {
     }
     remote.sun_family = AF_UNIX;
     strcpy(remote.sun_path, sockPath);
-    unlink(remote.sun_path);
+    unlink(remote.sun_path); ///problem here with unlink
     len = strlen(remote.sun_path) + sizeof(remote.sun_family);
     if (bind(sockfd, (struct sockaddr *) &remote, len) < 0) {
         return -2;
