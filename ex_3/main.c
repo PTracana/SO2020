@@ -7,17 +7,32 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <pthread.h>
+#include <sys/types.h>
 #include <unistd.h>
-
+#include <pthread.h>
 
 #define MAX_INPUT_SIZE 100
 
 /*global variables that are used when initializing the program:
-tecnicofs inputfile outputfile maxThreads synchstrategy*/
+tecnicofs maxThreads nomeSocket*/
 
 int maxThreads = 0;             //maximum number of threads is stored here
+int isPrinting = 0;             //0 for not printing, 1 for printing, 2 for waiting state
+int modThreads = 0;             //stores number of threads that have modifying behavior
 char* nomeSocket = NULL;        //socket identification
+
+//this condition variable and lock garantees that the program only prints if there are no other active operations that modify the tree
+pthread_mutex_t printLock =  PTHREAD_MUTEX_INITIALIZER; 
+pthread_cond_t printCond = PTHREAD_COND_INITIALIZER;
+
+//this condition variable and lock garantees that while the program is printing, the other threads can't modify the tree
+pthread_mutex_t opLock =  PTHREAD_MUTEX_INITIALIZER; 
+pthread_cond_t opCond = PTHREAD_COND_INITIALIZER;
+
+int sockfd;
+struct sockaddr_un remote, local;
+socklen_t servlen, clilen;
+FILE* outputFile;
 
 
 static void arguments(int argc, char* const argv[]) {   //this function parses the program's variables
@@ -43,17 +58,19 @@ FILE* openOutput(char* filename) {        //the output file is opened for writin
     return outputFile;
 }
 
-void* applyCommands() {
+void* applyCommands() {     //this fuction receives a command from a client and executes the associated function
     while(1) {
-        char* command = removeCommand();
-        if (command == NULL){
-            continue;
-        }
+        char* command = malloc(sizeof(char) * 100);
         int numTokens;
         char token, type;
         char name[MAX_INPUT_SIZE];
         char name2[MAX_INPUT_SIZE];
-        if(command[0] == 'm'){
+        if(recvfrom(sockfd, command, sizeof(char) * 100, 0, (struct sockaddr *) &local, &clilen) < 0) {
+            perror("Receive Error");
+            free(command);
+            return NULL;
+        }
+        else if(command[0] == 'm'){
             numTokens = sscanf(command, "%c %s %s", &token, name, name2);
         }
         else if(command[0] == 'p') {
@@ -63,74 +80,107 @@ void* applyCommands() {
             numTokens = sscanf(command, "%c %s %c", &token, name, &type);
         }
         free(command);
+
         if (numTokens < 2) {
             fprintf(stderr, "Error: invalid command in Queue\n");
             exit(EXIT_FAILURE);
         }
+        else if(token != 'l' && isPrinting == 1) {
+            pthread_mutex_lock(&opLock);
+            pthread_cond_wait(&opCond, &opLock);    //every thread with modifying behavior waits until the program finishes printing
+            pthread_mutex_unlock(&opLock);
+        }
 
-        int searchResult;
-        switch (token) {
-            case 'c':       //in case we want to create something, a writelock prevents other threads from doing the same before this one
+        int result = 0;        //this variable saves the output of the applied command an it is sent back to the client as a reply
+        switch (token) {      //there are 5 different types of commands: c (create), d (delete), l (lookup), m (move) and p (print)
+            case 'c':
                 switch (type) {
                     case 'f':
+                        modThreads++;
                         printf("Create file: %s\n", name);
-                        create(name, T_FILE);
+                        result = create(name, T_FILE);
                         break;
                     case 'd':
+                        modThreads++;
                         printf("Create directory: %s\n", name);
-                        create(name, T_DIRECTORY);
+                        result = create(name, T_DIRECTORY);
                         break;
                     default:
                         fprintf(stderr, "Error: invalid node type\n");
+                        sendto(sockfd, "error", sizeof(char) * 100, 0, (struct sockaddr *) &local, clilen);
                         exit(EXIT_FAILURE);
                 }
+                modThreads--;
                 break;
-            case 'l':       //in case we want to lookup something, a readlock prevents other threads from doing the same before this one
-                searchResult = lookup(name);
-                if (searchResult >= 0)
+            case 'l':       
+                result = lookup(name);
+                if (result >= 0)
                     printf("Search: %s found\n", name);
                 else
                     printf("Search: %s not found\n", name);
                 break;
-            case 'd':       //in case we want to delete something, a writelock prevents other threads from doing the same before this one
+            case 'd':       
+                modThreads++;
                 printf("Delete: %s\n", name);
-                delete(name);
+                result = delete(name);
+                modThreads--;
                 break;
-            case 'm': 
-                searchResult = lookup(name);
-                if (searchResult >= 0){
+            case 'm':
+                modThreads++; 
+                result = lookup(name);
+                if (result >= 0){
                     printf("Search: %s found\n", name);
-                    searchResult = lookup(name2);
-                    if (searchResult >= 0){
-                        printf("Search: %s found\n", name);
-                        move(name, name2);
+                    result = lookup(name2);
+                    if (result >= 0){
+                        printf("Search: %s found\n", name2);
+                        result = move(name, name2);
+                        modThreads--;
                     }          
                     else{
-                        printf("Search: %s not found\n", name);
+                        printf("Search: %s not found\n", name2);
+                        modThreads--;
                         break;
                     }
                 }
-                else{
+                else {
                     printf("Search: %s not found\n", name);
+                    modThreads--;
                     break;
                 }
             case 'p':
-                //wait for other tasks to finish and prevent more tasks from being started
-                FILE* outputFile = openOutput(name);
+                //waits for other tasks to finish and prevents more tasks from being started (only applies to create, delete and move)
+                isPrinting = 2;     //waiting state
+                if(modThreads > 0) {
+                    pthread_mutex_lock(&printLock);
+                    pthread_cond_wait(&printCond, &printLock);
+                    pthread_mutex_unlock(&printLock);
+                }
+                isPrinting = 1;     //printing state
+                outputFile = openOutput(name);
                 print_tecnicofs_tree(outputFile);
                 fclose(outputFile);
+                isPrinting = 0;
+                pthread_cond_signal(&opCond);   //when the printing is done, the threads can freely apply all kinds of commands
                 break;
             
             default: { /* error */
                 fprintf(stderr, "Error: command to apply\n");
+                sendto(sockfd, "error", sizeof(char) * 100, 0, (struct sockaddr *) &local, clilen);
                 exit(EXIT_FAILURE);
             }
         }
-    return NULL;
+        if(modThreads == 0 && isPrinting == 1) {
+            pthread_cond_signal(&printCond); //the program can print if there are no active modifying commands
+        }
+        char* reply = malloc(sizeof(char) * 10);
+        sprintf(reply, "%d", result);
+        sendto(sockfd, reply, sizeof(char) * 100, 0, (struct sockaddr *) &local, clilen);
+        free(reply);
     }
+    return NULL;
 }
 
-void runThreads() {
+void runThreads() {     //this function works as a thread creator and manager
     pthread_t* thread_list = malloc(maxThreads * sizeof(pthread_t));
     for(int i = 0; i < maxThreads; i++) {
         if(pthread_create(&thread_list[i], NULL, applyCommands, NULL) != 0) {
@@ -145,23 +195,23 @@ void runThreads() {
         }
     }
     free(thread_list);
-
 }
 
-int setSocket(char* sockPath) {
-    int sockfd;
-    struct sockaddr_un remote;
-    socklen_t len;
-    if((sockfd = sock(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
+int setSocket(char* sockPath) {  //this function creates a socket to establish a connection between the server and a client
+    if((sockfd = socket(AF_UNIX, SOCK_DGRAM, 0)) < 0) {
+        perror("Sock Error");
         return -1;
     }
+    printf("Socket created\n");
     remote.sun_family = AF_UNIX;
     strcpy(remote.sun_path, sockPath);
-    unlink(remote.sun_path); ///problem here with unlink
-    len = strlen(remote.sun_path) + sizeof(remote.sun_family);
-    if (bind(sockfd, (struct sockaddr *) &remote, len) < 0) {
+    clilen = sizeof(struct sockaddr_un);
+    servlen = sizeof(struct sockaddr_un);
+    if(bind(sockfd, (struct sockaddr *) &remote, servlen) < 0) {
+        perror("Bind Error");
         return -2;
-    }  
+    }
+    printf("Listening...\n");
     return 0;
 }
 
@@ -177,13 +227,13 @@ int main(int argc, char* argv[]) {
         exit(EXIT_FAILURE);
     }
     
-    init_fs();      // init filesystem
+    init_fs();      // initializes filesystem
     if(gettimeofday(&startTime, NULL) != 0) {   //the program obtains its starting time from the pc's clock
         fprintf(stderr, "Couldn't get time\n");
         exit(EXIT_FAILURE);
     }
 
-    runThreads();
+    runThreads();  //threads are created and begin receiving commands
 
     if(gettimeofday(&stopTime, NULL) != 0) {    //the program obtains its stopping time from the pc's clock
         fprintf(stderr, "Couldn't get time\n");

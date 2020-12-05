@@ -4,6 +4,7 @@
 #include "../tecnicofs-api-constants.h"
 
 FILE* inputFile;
+char* filename;
 char* serverName;
 
 static void displayUsage (const char* appName) {
@@ -18,10 +19,10 @@ static void parseArgs (long argc, char* const argv[]) {
     }
 
     serverName = argv[2];
+    filename = argv[1];
+    inputFile = fopen(filename, "r");
 
-    inputFile = fopen(argv[1], "r");
-
-    if (inputFile== NULL) {
+    if (inputFile == NULL) {
         fprintf(stderr, "Error: cannot open input file\n");
         exit(EXIT_FAILURE);
     }
@@ -97,6 +98,13 @@ void *processInput() {
                   printf("Moved: %s to %s\n", arg1, arg2);
                 else
                   printf("Unable to move: %s to %s\n", arg1, arg2);
+                break;
+            case 'p':
+                res = tfsPrint(arg1);
+                if (!res)
+                  printf("Printed tecnicofs\n");
+                else
+                  printf("Unable to print tecnicofs\n");
                 break;
             case '#':
                 break;
